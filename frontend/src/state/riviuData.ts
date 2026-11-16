@@ -7,8 +7,8 @@ import { fetchMonths, fetchRows, type MonthEntry } from '@/lib/riviuData';
 import { PLATFORM_KEYS, SCRAPE_MODE_LABELS, isPlatform, platformConfig, type PlatformKey } from '@/lib/platforms';
 import { clearLive, type RunContext } from '@/lib/scan';
 import {
-  addLog, appStore, canAdmin, connectWS, loadScanSettings, notify, openModal, refreshCookieStatus, refreshProxyStatus, sendScanCommand,
-  storageHooks, swapShownScan, uiIsBusy, type AppState, type ModalName, type RdState,
+  addLog, appStore, canAdmin, connectWS, loadScanSettings, notify, openModal, RECENT_SCAN_SCOPE, refreshCookieStatus, refreshProxyStatus, sendScanCommand,
+  storageHooks, swapShownScan, uiIsBusy, type AppState, type ModalName, type RdScanChoice, type RdState,
 } from './app';
 
 const get = () => appStore.get();
@@ -113,6 +113,29 @@ export function monthsOf(state: AppState, platform: PlatformKey = state.activePl
 
 // ---- Scan ------------------------------------------------------------------------------
 
+/** The months "Quét" sends for the recent scope; the server resolves them (scan_service.resolve_store_months). */
+export const RECENT_SCAN_MONTHS = ['latest', 'previous'];
+
+export function rdScanChoice(state: AppState, platform: PlatformKey = state.activePlatform): RdScanChoice {
+  return state.rdScan?.[platform] ?? { scope: RECENT_SCAN_SCOPE, partner: '' };
+}
+
+/** Change what the shown platform's next scan covers; a new scope drops a partner it may not have. */
+export function setRdScanChoice(patch: Partial<RdScanChoice>) {
+  const platform = get().activePlatform;
+  set(state => {
+    const current = rdScanChoice(state, platform);
+    const next = { ...current, ...patch, ...(patch.scope !== undefined && patch.scope !== current.scope && patch.partner === undefined ? { partner: '' } : {}) };
+    return { rdScan: { ...state.rdScan, [platform]: next } };
+  });
+}
+
+/** "tháng mới nhất + tháng trước" or "Tháng 10/2026". */
+export function rdScanScopeLabel(state: AppState, choice: RdScanChoice = rdScanChoice(state)): string {
+  if (choice.scope === RECENT_SCAN_SCOPE || !THANG_PATTERN.test(choice.scope)) return 'Tháng mới nhất + tháng trước';
+  return monthsOf(state).find(month => month.thang === choice.scope)?.label || choice.scope;
+}
+
 export interface RdScanRequest {
   logLine: string;
   payload: Record<string, unknown>;
@@ -122,9 +145,10 @@ export interface RdScanRequest {
 export function buildRdScanRequest(state: AppState): { request: RdScanRequest | null; problem?: { message: string; open?: ModalName } } {
   const platform = state.activePlatform;
   const config = platformConfig(platform);
-  const thang = state.rd.thang[platform];
+  const choice = rdScanChoice(state, platform);
+  const recent = choice.scope === RECENT_SCAN_SCOPE || !THANG_PATTERN.test(choice.scope);
   const settings = state.scanSettings[platform];
-  if (!thang) return { request: null, problem: { message: 'Chưa có tháng nào để quét.' } };
+  if (!monthsOf(state, platform).length && !state.rd.thang[platform]) return { request: null, problem: { message: 'Chưa có tháng nào để quét.' } };
   const threads = state.cookies.threads;
   const useThreadsSession = config.cookieSession && settings.useSession;
   if (useThreadsSession && (!threads.configured || !threads.generation)) {
@@ -137,22 +161,24 @@ export function buildRdScanRequest(state: AppState): { request: RdScanRequest | 
   if (settings.useProxy && state.proxyCount <= 0) {
     return { request: null, problem: { message: 'Bật proxy nhưng chưa có danh sách. Bấm Cấu hình để dán proxy.', open: 'proxy' } };
   }
-  const month = monthsOf(state, platform).find(item => item.thang === thang);
   const modeLabel = SCRAPE_MODE_LABELS[settings.scrapeMode] || SCRAPE_MODE_LABELS.request;
   const extras = (settings.useProxy ? ' • proxy bật' : '') + (useThreadsSession ? ' • cookie Threads' : '') + (useTikTokSession ? ' • cookie TikTok' : '');
+  const partner = choice.partner.trim();
   return {
     request: {
       // Never include proxy text or cookies in the log line.
-      logLine: `Bắt đầu quét ${config.label} • ${month?.label || thang} • ${modeLabel}${extras} • luồng: ${settings.workers}.`,
+      logLine: `Bắt đầu quét ${config.label} • ${rdScanScopeLabel(state, choice)}${partner ? ` • chỉ đối tác: ${partner}` : ''} • ${modeLabel}${extras} • luồng: ${settings.workers}.`,
       payload: {
         action: 'start',
         platform,
-        sheet_name: thang,
+        // The recent scope names its months; the server scans them one after another.
+        sheet_name: recent ? '' : choice.scope,
+        ...(recent ? { months: RECENT_SCAN_MONTHS } : {}),
         workers: settings.workers,
         scrape_mode: settings.scrapeMode,
         use_proxy: settings.useProxy,
         proxy_text: '',
-        partners: [],
+        partners: partner ? [partner] : [],
         retry_failed: true,
         ...(useThreadsSession ? { use_threads_session: true, threads_session_generation: threads.generation } : {}),
         ...(useTikTokSession ? { use_tiktok_session: true } : {}),

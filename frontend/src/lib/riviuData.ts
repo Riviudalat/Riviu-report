@@ -115,17 +115,74 @@ export async function fetchRows(platform: PlatformKey, thang: string): Promise<{
   };
 }
 
-export function reportPartnersQuery(platform: PlatformKey, thang: string, applyMinViews: boolean, minViews: number): string {
-  return new URLSearchParams({ platform, thang, apply_min_views: applyMinViews ? 'true' : 'false', min_views: String(minViews) }).toString();
+/** What a report covers: one month sheet, or the posts aired from one day to another (both included). */
+export type ReportPeriod = { kind: 'month'; thang: string } | { kind: 'range'; from: string; to: string };
+
+const DAY_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
+
+/** Why a period cannot be reported yet, or ''. */
+export function periodProblem(period: ReportPeriod): string {
+  if (period.kind === 'month') return period.thang ? '' : 'Chưa có tháng';
+  if (!DAY_PATTERN.test(period.from) || !DAY_PATTERN.test(period.to)) return 'Chọn đủ từ ngày và đến ngày.';
+  if (period.from > period.to) return 'Từ ngày phải trước hoặc bằng đến ngày.';
+  return '';
+}
+
+/** "2026-11-05" -> "05/11/2026". */
+export function dayLabel(day: string): string {
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(day);
+  return match ? `${match[3]}/${match[2]}/${match[1]}` : day;
+}
+
+export function periodLabel(period: ReportPeriod, monthText = ''): string {
+  return period.kind === 'month' ? monthText || monthLabel(period.thang) : `${dayLabel(period.from)} – ${dayLabel(period.to)}`;
+}
+
+/** The first day of a month sheet and its last day (or today, while the month runs), as YYYY-MM-DD. */
+export function monthRange(thang: string, today: Date = new Date()): { from: string; to: string } {
+  const match = /^(\d{4})-(\d{2})$/.exec(thang);
+  const pad = (value: number) => String(value).padStart(2, '0');
+  const todayText = `${today.getFullYear()}-${pad(today.getMonth() + 1)}-${pad(today.getDate())}`;
+  if (!match) return { from: todayText, to: todayText };
+  const [year, month] = [Number(match[1]), Number(match[2])];
+  const last = `${match[1]}-${match[2]}-${pad(new Date(year, month, 0).getDate())}`;
+  const from = `${match[1]}-${match[2]}-01`;
+  return { from, to: todayText >= from && todayText < last ? todayText : last };
+}
+
+function periodParams(period: ReportPeriod): Record<string, string> {
+  return period.kind === 'month' ? { thang: period.thang } : { tu_ngay: period.from, den_ngay: period.to };
+}
+
+export function reportPartnersQuery(platform: PlatformKey, period: ReportPeriod, applyMinViews: boolean, minViews: number): string {
+  return new URLSearchParams({ platform, ...periodParams(period), apply_min_views: applyMinViews ? 'true' : 'false', min_views: String(minViews) }).toString();
 }
 
 export type ExportSubject = 'partner' | 'poster';
 
-/** POST /riviu-data/export-report: one report per partner, or per Người đăng (`by: "poster"`). */
-export function exportBody(platform: PlatformKey, thang: string, names: string[], applyMinViews: boolean, minViews: number, subject: ExportSubject = 'partner') {
+/** POST /riviu-data/export-report: one report per partner, or per Người đăng (`by: "poster"`), of a month or a date range. */
+export function exportBody(platform: PlatformKey, period: ReportPeriod, names: string[], applyMinViews: boolean, minViews: number, subject: ExportSubject = 'partner') {
+  const when = period.kind === 'month' ? { thang: period.thang } : { tuNgay: period.from, denNgay: period.to };
   return subject === 'poster'
-    ? { platform, thang, by: 'poster', posters: names, applyMinViews, minViews }
-    : { platform, thang, partners: names, applyMinViews, minViews };
+    ? { platform, ...when, by: 'poster', posters: names, applyMinViews, minViews }
+    : { platform, ...when, partners: names, applyMinViews, minViews };
+}
+
+export interface ScanPartner {
+  name: string;
+  /** Links of the scanned months that name this partner (live rows, links added since the last scan included). */
+  links: number;
+}
+
+/** GET /riviu-data/scan-partners (admin): the partners "Quét riêng đối tác" offers for these months. */
+export async function fetchScanPartners(platform: PlatformKey, months: string[]): Promise<ScanPartner[]> {
+  const params = new URLSearchParams({ platform, months: months.join(',') });
+  const { response, data } = await getJson<{ partners?: unknown; error?: string }>(`/riviu-data/scan-partners?${params}`, { cache: 'no-store' });
+  if (!response.ok) throw new Error(data.error || 'Không tải được danh sách đối tác.');
+  return (Array.isArray(data.partners) ? data.partners : [])
+    .map(item => item as Record<string, unknown>)
+    .filter(item => typeof item.name === 'string' && item.name.trim())
+    .map(item => ({ name: String(item.name), links: Number(item.links) || 0 }));
 }
 
 /** "2026-10" -> "Tháng 10/2026" (the server sends its own label; this is the fallback). */

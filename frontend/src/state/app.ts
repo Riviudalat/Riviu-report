@@ -118,6 +118,16 @@ export interface RdState {
   table: RdTable;
 }
 
+/** "Quét" on Riviu Data: the newest month and the one before it (the default), or one month. */
+export const RECENT_SCAN_SCOPE = 'recent';
+
+export interface RdScanChoice {
+  /** RECENT_SCAN_SCOPE or one "YYYY-MM". */
+  scope: string;
+  /** "Quét riêng đối tác": the partner the scan is limited to; '' = every link. */
+  partner: string;
+}
+
 export function defaultScanSettings(platform: PlatformKey): ScanSettings {
   return { workers: DEFAULT_WORKER_COUNT, scrapeMode: PLATFORMS[platform].defaultScrapeMode, useProxy: false, useSession: false };
 }
@@ -126,6 +136,8 @@ export interface AppState {
   viewer: Viewer;
   storage: StorageKind;
   rd: RdState;
+  /** Per platform: what the next Riviu Data scan covers (riviuData.buildRdScanRequest). */
+  rdScan: Record<PlatformKey, RdScanChoice>;
   scanSettings: Record<PlatformKey, ScanSettings>;
   activePlatform: PlatformKey;
   sources: Record<PlatformKey, SourceSlot>;
@@ -174,6 +186,7 @@ function initialState(): AppState {
       thang: Object.fromEntries(PLATFORM_KEYS.map(key => [key, ''])) as Record<PlatformKey, string>,
       table: { state: 'loading' },
     },
+    rdScan: Object.fromEntries(PLATFORM_KEYS.map(key => [key, { scope: RECENT_SCAN_SCOPE, partner: '' }])) as Record<PlatformKey, RdScanChoice>,
     scanSettings: Object.fromEntries(PLATFORM_KEYS.map(key => [key, defaultScanSettings(key)])) as Record<PlatformKey, ScanSettings>,
     activePlatform: PLATFORM_KEYS[0],
     sources: Object.fromEntries(PLATFORM_KEYS.map(key => [key, emptySource()])) as Record<PlatformKey, SourceSlot>,

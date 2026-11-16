@@ -1,21 +1,24 @@
 import { useEffect, useId, useMemo, useState, type ReactNode } from 'react';
+import { useQuery } from '@tanstack/react-query';
 import {
-  ChartColumnIcon, CircleStopIcon, CookieIcon, CopyIcon, DownloadIcon, EyeOffIcon, FileWarningIcon, GaugeIcon, Loader2Icon, NetworkIcon, PlayIcon, RadioIcon,
-  Rows3Icon, Settings2Icon, UserRoundIcon, SkipForwardIcon, SlidersHorizontalIcon, TerminalIcon, Trash2Icon, CopyPlusIcon,
+  CalendarRangeIcon, ChartColumnIcon, CircleStopIcon, CookieIcon, CopyIcon, DownloadIcon, EyeOffIcon, FileWarningIcon, GaugeIcon, HandshakeIcon, Loader2Icon,
+  NetworkIcon, PlayIcon, RadioIcon, Rows3Icon, Settings2Icon, UserRoundIcon, SkipForwardIcon, SlidersHorizontalIcon, TerminalIcon, Trash2Icon, CopyPlusIcon,
 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Badge, NativeSelect, Progress, Switch, Tip } from '@/components/ui/misc';
+import { Picker } from '@/components/ui/picker';
 import { formatNumber } from '@/lib/format';
 import { WORKER_OPTIONS, platformConfig, type PlatformKey, type ScrapeMode } from '@/lib/platforms';
+import { fetchScanPartners } from '@/lib/riviuData';
 import {
   failedLinksForKind, progressLineText, progressPercent, progressPlatform, progressResultCounts, progressStatusView, retryWaitText, scanIsBusy,
 } from '@/lib/scan';
 import { cn } from '@/lib/utils';
 import {
   cancelScraping, clearDuplicateLinks, clearFailedLinks, clearLogs, copyDuplicateLinks, copyFailedLinks, copyLogs, exportLogs, openModal, setWorkspaceTab,
-  skipRetryWait, startBlockedReason, uiIsBusy, updateScanSettings, useApp, type CookieKind, type WorkspaceTab,
+  RECENT_SCAN_SCOPE, skipRetryWait, startBlockedReason, uiIsBusy, updateScanSettings, useApp, type CookieKind, type WorkspaceTab,
 } from '@/state/app';
-import { monthsOf, startRdScan } from '@/state/riviuData';
+import { RECENT_SCAN_MONTHS, monthsOf, rdScanChoice, setRdScanChoice, startRdScan } from '@/state/riviuData';
 import { DuplicatesPanel, FailurePanel, LivePanel, LogsPanel } from '@/features/Workspace';
 import { LinkTablePanel } from './LinkTable';
 import { PosterPanel } from './PosterPanel';
@@ -103,6 +106,63 @@ function ProxyField({ platform }: { platform: PlatformKey }) {
   );
 }
 
+/** "Phạm vi": the newest month and the one before it (default), or one month sheet. */
+function ScopeField() {
+  const id = useId();
+  const scope = useApp(state => rdScanChoice(state).scope);
+  const months = useApp(state => monthsOf(state));
+  const busy = useApp(state => uiIsBusy(state));
+  const known = scope === RECENT_SCAN_SCOPE || months.some(month => month.thang === scope);
+  return (
+    <div className="flex min-w-0 flex-col gap-1.5">
+      <FieldLabel htmlFor={id} icon={<CalendarRangeIcon />}>Phạm vi</FieldLabel>
+      <NativeSelect id={id} className="sm:w-56" value={known ? scope : RECENT_SCAN_SCOPE} disabled={busy} data-testid="scan-scope"
+        onChange={event => setRdScanChoice({ scope: event.target.value })}>
+        <option value={RECENT_SCAN_SCOPE}>Tháng mới nhất + tháng trước</option>
+        {months.map(month => <option key={month.thang} value={month.thang}>Chỉ {month.label.replace(/^Tháng/, 'tháng')}</option>)}
+      </NativeSelect>
+    </div>
+  );
+}
+
+const ALL_PARTNERS = '';
+
+/** "Đối tác": every link (default), or only one partner's links ("Quét riêng đối tác"). */
+function PartnerField() {
+  const platform = useApp(state => state.activePlatform);
+  const choice = useApp(state => rdScanChoice(state));
+  const busy = useApp(state => uiIsBusy(state));
+  const months = choice.scope === RECENT_SCAN_SCOPE ? RECENT_SCAN_MONTHS : [choice.scope];
+  const query = useQuery({
+    queryKey: ['rd-scan-partners', platform, months.join(',')],
+    queryFn: () => fetchScanPartners(platform, months),
+    staleTime: 60_000,
+  });
+  const options = [
+    { value: ALL_PARTNERS, label: 'Tất cả đối tác' },
+    // A partner chosen before the list (re)loads stays selectable.
+    ...(choice.partner && !query.data?.some(item => item.name === choice.partner) ? [{ value: choice.partner, label: choice.partner }] : []),
+    ...(query.data ?? []).map(item => ({ value: item.name, label: item.name, hint: `${formatNumber(item.links)} link` })),
+  ];
+  return (
+    <div className="flex min-w-0 flex-col gap-1.5">
+      <FieldLabel icon={<HandshakeIcon />}>Đối tác</FieldLabel>
+      <Picker
+        value={choice.partner}
+        onChange={value => setRdScanChoice({ partner: value })}
+        options={options}
+        placeholder={query.isError ? 'Không tải được đối tác' : 'Tất cả đối tác'}
+        searchable
+        searchPlaceholder="Tìm đối tác…"
+        disabled={busy}
+        className={cn('w-full sm:w-52', choice.partner && 'border-primary/50 bg-accent/40')}
+        aria-label="Đối tác cần quét"
+        data-testid="scan-partner"
+      />
+    </div>
+  );
+}
+
 function ScanFields() {
   const workersId = useId();
   const modeId = useId();
@@ -111,6 +171,8 @@ function ScanFields() {
   const busy = useApp(state => uiIsBusy(state));
   return (
     <div className="grid min-w-0 grid-cols-2 gap-3 sm:flex sm:flex-wrap sm:items-end">
+      <ScopeField />
+      <PartnerField />
       <div className="flex flex-col gap-1.5">
         <FieldLabel htmlFor={workersId} icon={<GaugeIcon />}>Luồng</FieldLabel>
         <NativeSelect id={workersId} className="sm:w-20" value={String(settings.workers)} disabled={busy} onChange={event => void updateScanSettings(platform, { workers: Number(event.target.value) })}>
@@ -136,8 +198,11 @@ function ScanActions() {
   const busy = useApp(state => uiIsBusy(state));
   const blocked = useApp(state => (uiIsBusy(state) ? '' : startBlockedReason(state)));
   const reconnecting = useApp(state => state.connection !== '');
-  const monthLabel = useApp(state => monthsOf(state).find(month => month.thang === state.rd.thang[state.activePlatform])?.label || '');
+  const choice = useApp(state => rdScanChoice(state));
+  const monthLabel = useApp(state => monthsOf(state).find(month => month.thang === rdScanChoice(state).scope)?.label || '');
   const scanning = scanIsBusy(phase);
+  const what = choice.scope === RECENT_SCAN_SCOPE ? '2 tháng gần nhất' : monthLabel ? monthLabel.replace(/^Tháng/, 'tháng') : '';
+  const startLabel = what ? `Quét ${what}${choice.partner ? ` • ${choice.partner}` : ''}` : 'Bắt đầu quét';
   const cancelDisabled = !scanning || phase === 'saving' || phase === 'cancelling' || reconnecting;
   return (
     <div className="flex items-end gap-2 max-sm:w-full">
@@ -147,9 +212,9 @@ function ScanActions() {
       </Button>
       <Tip content={blocked}>
         <span className="max-sm:flex-[2]">
-          <Button onClick={() => void startRdScan()} disabled={busy || Boolean(blocked)} data-testid="start-scan" className="w-full sm:min-w-40">
+          <Button onClick={() => void startRdScan()} disabled={busy || Boolean(blocked)} data-testid="start-scan" className="w-full max-w-full sm:min-w-40 sm:max-w-72" title={startLabel}>
             {busy ? <Loader2Icon className="animate-spin" /> : <PlayIcon />}
-            {busy ? 'Đang quét…' : monthLabel ? `Quét ${monthLabel.replace(/^Tháng/, 'tháng')}` : 'Bắt đầu quét'}
+            <span className="truncate">{busy ? 'Đang quét…' : startLabel}</span>
           </Button>
         </span>
       </Tip>

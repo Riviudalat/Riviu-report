@@ -303,6 +303,35 @@ describe('public viewer page (/)', () => {
     click.mockRestore();
   });
 
+  it('exports a date range ("Từ ngày – đến ngày") instead of a month', async () => {
+    vi.stubGlobal('URL', Object.assign(URL, { createObjectURL: vi.fn(() => 'blob:x'), revokeObjectURL: vi.fn() }));
+    const click = vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(() => {});
+    renderAs(ANON, false);
+    act(() => openModal('export'));
+    const dialog = screen.getByRole('dialog');
+    await within(dialog).findByText('Cafe Mây');
+    await userEvent.click(within(dialog).getByRole('tab', { name: /Từ ngày – đến ngày/ }));
+    // It starts as the shown month (October 2026 is over: its last day).
+    expect(within(dialog).getByLabelText('Từ ngày')).toHaveValue('2026-10-01');
+    expect(within(dialog).getByLabelText('Đến ngày')).toHaveValue('2026-10-31');
+    // An end before the start is refused before anything is asked of the server.
+    fireEvent.change(within(dialog).getByLabelText('Đến ngày'), { target: { value: '2026-09-30' } });
+    expect(within(dialog).getByText('Từ ngày phải trước hoặc bằng đến ngày.')).toBeInTheDocument();
+    expect(within(dialog).getByTestId('export-report')).toBeDisabled();
+    fireEvent.change(within(dialog).getByLabelText('Từ ngày'), { target: { value: '2026-10-15' } });
+    fireEvent.change(within(dialog).getByLabelText('Đến ngày'), { target: { value: '2026-11-05' } });
+    expect(within(dialog).getByText(/15\/10\/2026 – 05\/11\/2026/)).toBeInTheDocument();
+    const rangeQuery = '/riviu-data/report-partners?platform=tiktok&tu_ngay=2026-10-15&den_ngay=2026-11-05&apply_min_views=true&min_views=100';
+    await vi.waitFor(() => expect(calls.some(call => call.url === rangeQuery)).toBe(true));
+    await userEvent.click(await within(dialog).findByRole('checkbox', { name: 'Cafe Mây' }));
+    await userEvent.click(within(dialog).getByTestId('export-report'));
+    await vi.waitFor(() => expect(calls.some(call => call.url === '/riviu-data/export-report')).toBe(true));
+    expect(JSON.parse(String(calls.find(call => call.url === '/riviu-data/export-report')?.init?.body))).toEqual({
+      platform: 'tiktok', tuNgay: '2026-10-15', denNgay: '2026-11-05', partners: ['Cafe Mây'], applyMinViews: true, minViews: 100,
+    });
+    click.mockRestore();
+  });
+
   it("switches platform and partner/poster tabs inside the export dialog, keeping each tab's ticks", async () => {
     vi.stubGlobal('URL', Object.assign(URL, { createObjectURL: vi.fn(() => 'blob:x'), revokeObjectURL: vi.fn() }));
     const click = vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(() => {});
@@ -332,7 +361,7 @@ describe('admin page (/admin)', () => {
   it('has the scan toolbar, schedule, settings and a logout button', () => {
     renderAs(ADMIN, true);
     expect(screen.getByTestId('scan-toolbar')).toBeInTheDocument();
-    expect(screen.getByTestId('start-scan')).toHaveTextContent('Quét tháng 10/2026');
+    expect(screen.getByTestId('start-scan')).toHaveTextContent('Quét 2 tháng gần nhất');
     expect(screen.getByRole('button', { name: 'Hẹn giờ tự động' })).toBeInTheDocument();
     expect(screen.getByTestId('settings-menu')).toBeInTheDocument();
     expect(screen.getByTestId('logout')).toHaveTextContent('Đăng xuất');
@@ -350,8 +379,10 @@ describe('admin page (/admin)', () => {
 
   it('starts a month scan and offers "Bỏ qua quét lại" during the cooldown', async () => {
     renderAs(ADMIN, true);
+    fireEvent.change(screen.getByTestId('scan-scope'), { target: { value: '2026-10' } });
+    expect(screen.getByTestId('start-scan')).toHaveTextContent('Quét tháng 10/2026');
     await userEvent.click(screen.getByTestId('start-scan'));
-    expect(sent[0]).toMatchObject({ action: 'start', platform: 'tiktok', sheet_name: '2026-10', retry_failed: true });
+    expect(sent[0]).toMatchObject({ action: 'start', platform: 'tiktok', sheet_name: '2026-10', partners: [], retry_failed: true });
     expect(screen.getByTestId('start-scan')).toBeDisabled();
     act(() => handleSocketMessage({ type: 'status', ...ctx, data: { phase: 'running', retryPass: true, retryWaitSeconds: 300, total: 2, processed: 2, success: 1, retryCount: 1 } }));
     expect(screen.getByTestId('progress-text')).toHaveTextContent(/Chờ quét lại 1 link lỗi lúc \d\d:\d\d \(còn [45]:\d\d\)/);
@@ -373,15 +404,17 @@ describe('admin page (/admin)', () => {
     expect(within(dialog).getByTestId('save-schedule')).toBeDisabled();
     fireEvent.change(within(dialog).getByLabelText('Giờ mới'), { target: { value: '08:30' } });
     await userEvent.click(within(dialog).getByRole('button', { name: /Thêm giờ/ }));
-    // The 21:00 slot also scans October 2026, besides the newest month.
+    // The 21:00 slot (no month list: the newest month and the one before it) also scans October 2026.
     await userEvent.click(within(dialog).getByRole('button', { name: 'Chọn tháng cho 21:00' }));
     await userEvent.click(await screen.findByRole('checkbox', { name: /Tháng 10\/2026/ }));
-    expect(within(dialog).getByTestId('slot-months-21:00')).toHaveTextContent('Tháng mới nhấtTháng 10/2026');
+    expect(within(dialog).getByTestId('slot-months-21:00')).toHaveTextContent('Tháng mới nhấtTháng trướcTháng 10/2026');
     await userEvent.keyboard('{Escape}');
     await userEvent.click(within(dialog).getByTestId('save-schedule'));
     await vi.waitFor(() => expect(calls.some(call => call.url === '/schedule' && call.init?.method === 'POST')).toBe(true));
     const body = JSON.parse(String(calls.find(call => call.init?.method === 'POST' && call.url === '/schedule')?.init?.body));
-    expect(body.platforms.tiktok.slots).toEqual([{ time: '08:30', enabled: true, months: ['latest'] }, { time: '21:00', enabled: true, months: ['latest', '2026-10'] }]);
+    expect(body.platforms.tiktok.slots).toEqual([
+      { time: '08:30', enabled: true, months: ['latest', 'previous'] }, { time: '21:00', enabled: true, months: ['latest', 'previous', '2026-10'] },
+    ]);
     expect(body.platforms.threads.options.scrapeMode).toBe('hybrid');
   });
 

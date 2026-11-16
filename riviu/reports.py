@@ -530,7 +530,7 @@ def build_poster_export_payload_from_rows(sheet_rows, selected_posters, apply_mi
     wanted = {clean_text(name) for name in selected_posters if clean_text(name)}
     posters = sorted((name for name in groups if name in wanted), key=poster_sort_key)
     if not posters:
-        raise ValueError("Không tìm thấy người đăng đã chọn trong tháng này")
+        raise ValueError("Không tìm thấy người đăng đã chọn trong khoảng báo cáo này")
     return render_export_payload(
         spec, posters, groups, report_sheet, apply_min_views, min_views, format_filename_datetime(), subject=SUBJECT_POSTER,
     )

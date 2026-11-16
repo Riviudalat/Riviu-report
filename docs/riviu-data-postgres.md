@@ -20,7 +20,7 @@ background: Riviu Data `docs/integration-and-ops.md` §1 and §4.6, `docs/review
 | `riviu/store/postgres.py` | `PostgresStore` (reads, `open_scan`, `report_rows`), `PostgresScanSession` (buffered writes, `flush`), advisory lock and `scan_run` helpers |
 | `riviu/internal_scan.py` | The scan behind `POST /internal/scan`: lock, `scan_run`, run, close |
 | `riviu/api/internal.py` | `POST /internal/scan` (bearer token) |
-| `riviu/api/riviu_data.py` | `GET /riviu-data/report-partners`, `GET /riviu-data/report-posters`, `POST /riviu-data/export-report` |
+| `riviu/api/riviu_data.py` | `GET /riviu-data/report-partners`, `GET /riviu-data/report-posters`, `POST /riviu-data/export-report` (a month or a date range), `GET /riviu-data/scan-partners` (admin) |
 
 The scanners were not forked. `run_scraper(..., store_session=...)` and
 `run_threads_scraper(..., store_session=...)` take rows from the session and send each result to
@@ -127,6 +127,9 @@ Authorization: Bearer <token with scope scan:run>
   compared in constant time against SHA-256 digests (`hmac.compare_digest`, every entry checked).
 - The advisory lock is taken on a dedicated connection held for the whole scan and released
   explicitly before it closes (never pooled, review M-25).
+- A scan limited to some partners (**Quét riêng đối tác**, `partners` in the `/ws` start payload) records
+  them as `scan_run.diagnostic.partners` (in its INSERT, or merged into a requested row's diagnostic);
+  a whole-month scan records none. The published snapshot reads them back (see Reports).
 - `scan_run`: a given `scan_run_id` (Riviu Data's `phase='yeu_cau'` row) is reused (`phase`
   `dang_quet`, `thang_nam`; `mode` kept if set), otherwise a new row (`mode` = trigger). This needs
   the column-limited UPDATE on `scan_run` (granted since 0011); without it the scan fails to start
@@ -152,6 +155,21 @@ once and kept in memory for that scan_run. Links staff add afterwards, and the n
 scan is writing, appear only when the next scan of the month ends (both scan paths call
 `published.refresh` after closing their scan_run). A month with no finished scan shows its rows as
 they are now. The web app has no "Làm mới" button: it reloads the month when a scan ends.
+
+A **partner scan** (`scan_run.diagnostic.partners`) that finished after the last whole-month scan also
+moves the snapshot: a post shows when it was added before that whole-month scan started, or before
+a later scan of one of its partners started (the match is the scan's own: partner names casefolded,
+`postgres.published_record`). So scanning one partner in the afternoon publishes that partner's
+links added since the morning, with what the scan read, and other partners' new links still wait.
+Partner scans alone (no whole-month scan of the month finished yet) do not start a snapshot.
+
+**Date-range reports (16/11/2026).** `report-partners` / `report-posters` take `tu_ngay` and `den_ngay`
+(`YYYY-MM-DD`, both included, at most 400 days) in place of `thang`, and `export-report` takes `tuNgay`
+/ `denNgay`. The rows are the published snapshots of the month sheets from the month before the range
+to the month after it (staff sometimes file a post a month early or late), cut to the posts whose
+NGÀY AIR is in the range and sorted by NGÀY AIR; posts without a NGÀY AIR are left out and counted
+(`undated`). The partner list, filters, totals and Excel layout are the month report's; the files are
+tagged `<dd-mm-yyyy>_den_<dd-mm-yyyy>` instead of the month.
 
 `GET /riviu-data/report-partners?platform=&thang=&apply_min_views=&min_views=` and
 `POST /riviu-data/export-report {"platform","thang","partners","applyMinViews","minViews"}` return the
@@ -182,7 +200,17 @@ workbook file and sheet:
   `riviu-reports:lich`) for the whole run. Each pass (main, retry) opens a fresh store session, so the
   retry pass reads current rows and the scan journal resumes by `(month, id, url)`. There is no result tab
   and no Google push. The scheduler does not download a Google Sheet; each slot scans its `months`
-  (`"latest"` = the default month, plus any `YYYY-MM`), one after another.
+  (`"latest"` = the default month, `"previous"` = the calendar month before it, plus any `YYYY-MM`),
+  one after another. A slot without a month list, and a new slot in the dialog, scans `["latest",
+  "previous"]` (owner, 16/11/2026: the newest month and one old month).
+- The admin page's **Quét** has a **Phạm vi** (default *Tháng mới nhất + tháng trước*, or one month)
+  and an **Đối tác** picker (*Tất cả đối tác*, or one partner: "Quét riêng đối tác", fed by
+  `GET /riviu-data/scan-partners?platform=&months=latest,previous`, the partners named on the months'
+  live unlocked posts with their link counts, admin only). The `/ws` start then carries
+  `"months": ["latest", "previous"]` (resolved by `scan_service.resolve_store_months`): the first month
+  starts at once, the others one after another as their own runs and scan_run rows
+  (`scan_service.continue_with_months`); a cancel ends the sequence, a failed month does not. A server
+  restart resumes only the month that was running.
 - `ngayAir` and `nguoiAir` (Riviu Data's `nguoi_air`, read as `to_jsonb(v) ->> 'nguoi_air'` so the
   query also ran before migration 0013) come from the post; the web app shows the Người đăng column
   once any row has a value.

@@ -92,6 +92,15 @@ _pacer_sleep = asyncio.sleep
 # Suggested wait before scanning again after Threads answers HTTP 429.
 THREADS_RATE_LIMIT_WAIT_MINUTES = 10
 RATE_LIMIT_STOP_REASON = "rate_limit"
+# A cookie-session page that shows no login evidence ("auth_unknown") once earlier pages of the
+# pass were verified as logged in: the cookie is checked again on the run's route (at most once per
+# SESSION_RECHECK_SECONDS). Still valid: that page is a retryable error and the run goes on. Not
+# valid, or more than MAX_UNVERIFIED_PAGES such pages in one pass: the run stops as before. Evidence
+# (15-16/11/2026 07:30 server scans): single pages answered without login evidence stopped the
+# November scan after 82 and 472 of 508 links, while the cookie checked valid again right after.
+SESSION_RECHECK_SECONDS = 120
+MAX_UNVERIFIED_PAGES = 20
+UNVERIFIED_PAGE_MESSAGE = "Trang bài chưa xác minh được phiên đăng nhập Threads (cookie vẫn hợp lệ); giữ số cũ, sẽ quét lại."
 
 
 def resolve_threads_proxies(base_dir, proxy_text="", mode="request"):
@@ -1216,13 +1225,42 @@ async def _run_threads_scraper(file_path, websocket_manager=None, worker_count=3
             return item, merge_results(request_result, browser_result), "Hybrid"
 
         recorded = set()
+        session_proof = {"verifiedPages": 0, "unverifiedPages": 0, "checkedAt": None}
+
+        async def tolerate_unverified_page(item):
+            """True when an `auth_unknown` page may be recorded as a retryable error (see
+            SESSION_RECHECK_SECONDS); False when the run must stop on it as before."""
+            if not session_proof["verifiedPages"]:
+                return False  # the session has not shown a logged-in page in this pass yet
+            session_proof["unverifiedPages"] += 1
+            if session_proof["unverifiedPages"] > MAX_UNVERIFIED_PAGES:
+                return False
+            checked = session_proof["checkedAt"]
+            if checked is None or _checkpoint_clock() - checked >= SESSION_RECHECK_SECONDS:
+                check = await threads_session.verify_cookies(session_cookies, proxies[0] if proxies else None)
+                if check.get("state") != "valid":
+                    return False
+                session_proof["checkedAt"] = _checkpoint_clock()
+                if websocket_manager:
+                    await websocket_manager.broadcast_log(
+                        f"CẢNH BÁO: Một bài Threads chưa xác minh được phiên đăng nhập ({item['url']}); đã kiểm lại cookie: "
+                        "vẫn hợp lệ, tiếp tục quét. Bài này giữ số cũ và được quét lại sau lượt chính.")
+            if diagnostics is not None:
+                diagnostics["unverifiedPages"] = session_proof["unverifiedPages"]
+            return True
 
         async def record(item, result, source):
             nonlocal processed, success, hidden, errors, dirty
-            if session_cookies is not None and result.get("error_kind") in {"auth_invalid", "auth_checkpoint", "auth_unknown"}:
-                if diagnostics is not None:
-                    diagnostics["authState"] = result["error_kind"].removeprefix("auth_")
-                raise threads_session.SessionError(result["error_kind"].removeprefix("auth_"))
+            kind = result.get("error_kind")
+            if session_cookies is not None and kind in {"auth_invalid", "auth_checkpoint", "auth_unknown"}:
+                if kind == "auth_unknown" and await tolerate_unverified_page(item):
+                    result = failure(UNVERIFIED_PAGE_MESSAGE, "auth_unknown")
+                else:
+                    if diagnostics is not None:
+                        diagnostics["authState"] = kind.removeprefix("auth_")
+                    raise threads_session.SessionError(kind.removeprefix("auth_"))
+            elif session_cookies is not None and result.get("auth_verified") is True:
+                session_proof["verifiedPages"] += 1
             recorded.add(id(item))
             processed += 1
             status = result_status(result)

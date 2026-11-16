@@ -79,18 +79,21 @@ describe('table helpers', () => {
 describe('schedule helpers', () => {
   it('adds slots sorted and refuses duplicates or bad times', () => {
     const slots = addSlot([{ time: '21:00', enabled: true, months: ['2026-09'] }], '08:30');
-    expect(slots).toEqual([{ time: '08:30', enabled: true, months: ['latest'] }, { time: '21:00', enabled: true, months: ['2026-09'] }]);
+    // A new slot scans the newest month and the one before it.
+    expect(slots).toEqual([{ time: '08:30', enabled: true, months: ['latest', 'previous'] }, { time: '21:00', enabled: true, months: ['2026-09'] }]);
     expect(addSlot([{ time: '21:00', enabled: true, months: ['latest'] }], '21:00')).toBe('Đã có khung giờ 21:00.');
     expect(addSlot([], '25:00')).toMatch(/HH:MM/);
   });
 
   it('reads the server overview and formats times in the schedule clock', () => {
     const overview = normalizeOverview({ schedule: { platforms: { tiktok: { slots: [
-      { time: '07:00', enabled: false }, { time: 'x' }, { time: '13:15', months: ['2025-06', 'bad', 'latest', '2026-09'] },
+      { time: '07:00', enabled: false }, { time: 'x' }, { time: '13:15', months: ['2025-06', 'previous', 'bad', 'latest', '2026-09'] },
     ], options: { workers: 5 } } } }, runs: [] });
-    // Months: the newest month when missing; "latest" first, then newest first, invalid values dropped.
+    // Months: the newest month and the one before it when missing; "latest", "previous", then newest
+    // first, invalid values dropped.
     expect(overview.schedule.platforms.tiktok.slots).toEqual([
-      { time: '07:00', enabled: false, months: ['latest'] }, { time: '13:15', enabled: true, months: ['latest', '2026-09', '2025-06'] },
+      { time: '07:00', enabled: false, months: ['latest', 'previous'] },
+      { time: '13:15', enabled: true, months: ['latest', 'previous', '2026-09', '2025-06'] },
     ]);
     expect(overview.schedule.platforms.tiktok.options).toMatchObject({ workers: 5, retryFailed: true });
     expect(overview.schedule.platforms.threads.options.scrapeMode).toBe('hybrid');

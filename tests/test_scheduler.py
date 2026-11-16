@@ -43,13 +43,14 @@ def config(**platforms):
 
 def test_schedule_normalizes_sorts_and_fills_defaults():
     schedule = scheduler.normalize_schedule({"platforms": {
-        "tiktok": {"slots": [{"time": "17:30", "enabled": False, "months": ["2025-09", "latest", "2026-09", "2025-09"]}, {"time": "08:00"}],
+        "tiktok": {"slots": [{"time": "17:30", "enabled": False, "months": ["2025-09", "previous", "latest", "2026-09", "2025-09"]}, {"time": "08:00"}],
                    "options": {"workers": 20, "scrapeMode": "hybrid", "useProxy": True, "useSession": False, "retryFailed": False}},
     }})
     assert schedule == {"version": 1, "platforms": {
-        # Months: the newest month by default; "latest" first, then newest first, without repeats.
-        "tiktok": {"slots": [{"time": "08:00", "enabled": True, "months": ["latest"]},
-                             {"time": "17:30", "enabled": False, "months": ["latest", "2026-09", "2025-09"]}],
+        # Months: the newest month and the one before it by default; "latest", "previous", then
+        # newest first, without repeats.
+        "tiktok": {"slots": [{"time": "08:00", "enabled": True, "months": ["latest", "previous"]},
+                             {"time": "17:30", "enabled": False, "months": ["latest", "previous", "2026-09", "2025-09"]}],
                    "options": {"workers": 20, "scrapeMode": "hybrid", "useProxy": True, "useSession": False, "retryFailed": False}},
         "threads": {"slots": [], "options": {"workers": 10, "scrapeMode": "hybrid", "useProxy": False, "useSession": False, "retryFailed": True}},
     }}
@@ -397,7 +398,7 @@ def test_riviu_data_slots_scan_their_months_with_the_platforms_side_by_side(tmp_
     events = []
 
     async def newest(platform, value):
-        return value or "2026-10"
+        return {"latest": "2026-10", "previous": "2026-09"}.get(value, value)
 
     async def prepare(payload):
         return None, scan_service.scan_options(platform=payload["platform"], file_id=payload["file_id"], sheet_name=payload["sheet_name"])
@@ -416,12 +417,14 @@ def test_riviu_data_slots_scan_their_months_with_the_platforms_side_by_side(tmp_
     asyncio.run(scheduler.Scheduler().run_jobs([("tiktok", "08:15", at(8, 15)), ("threads", "08:15", at(8, 15))]))
 
     starts = [event[1:3] for event in events if event[0] == "start"]
-    # TikTok: the newest month once (latest = 2026-10), then 2026-09; Threads: its newest month.
+    # TikTok: the newest month once (latest = 2026-10), then 2026-09; Threads, with no month list:
+    # the newest month and the one before it.
     assert [month for platform, month in starts if platform == "tiktok"] == ["2026-10", "2026-09"]
-    assert [month for platform, month in starts if platform == "threads"] == ["2026-10"]
+    assert [month for platform, month in starts if platform == "threads"] == ["2026-10", "2026-09"]
     # Both platforms started before either ended, each in its own lane.
     assert {event[1] for event in events[:2] if event[0] == "start"} == {"tiktok", "threads"}
     assert events[1][3:] == (True, True)
     runs = scheduler.load_runs()
     assert sorted((run["platform"], run["sheet"], run["status"]) for run in runs) == [
-        ("threads", "2026-10", "completed"), ("tiktok", "2026-09", "completed"), ("tiktok", "2026-10", "completed")]
+        ("threads", "2026-09", "completed"), ("threads", "2026-10", "completed"),
+        ("tiktok", "2026-09", "completed"), ("tiktok", "2026-10", "completed")]

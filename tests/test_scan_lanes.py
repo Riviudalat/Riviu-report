@@ -74,3 +74,60 @@ def test_interrupted_scans_of_both_lanes_resume_side_by_side(lanes, monkeypatch)
     asyncio.run(restart())
     assert sorted(item[:2] for item in started) == [("threads", "threads"), ("tiktok", "tiktok")]
     assert started[-1][2:] == (True, True)  # the second resume started while the first still ran
+
+
+def _quick_runs(monkeypatch, started, seconds=0.05):
+    """Fake prepare/run: each scan records its month, waits `seconds` and completes."""
+    async def prepare(payload):
+        return None, scan_service.scan_options(
+            platform=payload.get("platform", "tiktok"), file_id=scan_service.RIVIU_DATA_FILE_ID, sheet_name=payload["sheet_name"],
+            partners=payload.get("partners") or [])
+
+    async def runner(_target, options, run_context=None):
+        started.append((options["sheet_name"], tuple(options["partners"])))
+        await asyncio.sleep(seconds)
+        await scan_state.lane(options["platform"]).manager.broadcast_status({"done": True, "phase": "completed"})
+
+    monkeypatch.setattr(scan_service, "prepare_scan_start", prepare)
+    monkeypatch.setattr(scan_service, "run_scraper_safely", runner)
+
+
+def test_quet_with_the_recent_scope_scans_the_newest_month_then_the_one_before_it(lanes, monkeypatch):
+    # The admin page's "Quét 2 tháng gần nhất" (owner, 16/11/2026), here limited to one partner.
+    import time
+
+    from fastapi.testclient import TestClient
+    from riviu import app as backend
+    from riviu.api import riviu_data
+
+    async def months(_platform):
+        return [("2026-12", 1), ("2026-11", 9), ("2026-10", 30)]  # December created early
+
+    monkeypatch.setattr(scan_service, "store_months", months)
+    monkeypatch.setattr(riviu_data, "current_thang", lambda: "2026-11")
+    started = []
+    _quick_runs(monkeypatch, started)
+    with TestClient(backend.app, base_url="http://127.0.0.1:1231") as client:
+        assert client.get("/").status_code == 200
+        with client.websocket_connect("ws://127.0.0.1:1231/ws", headers={"Origin": "http://127.0.0.1:1231"}) as ws:
+            ws.send_json({"action": "start", "platform": "tiktok", "sheet_name": "", "months": ["latest", "previous"], "partners": ["Cafe A"]})
+            deadline = time.monotonic() + 5
+            while len(started) < 2 and time.monotonic() < deadline:
+                time.sleep(0.02)
+    assert started == [("2026-11", ("Cafe A",)), ("2026-10", ("Cafe A",))]
+
+
+def test_a_cancel_ends_a_multi_month_scan(lanes, monkeypatch):
+    started = []
+    _quick_runs(monkeypatch, started)
+
+    async def scenario():
+        task, context = scan_service.start_scan_task(None, (await scan_service.prepare_scan_start({"sheet_name": "2026-11"}))[1])
+        sequence = scan_service.continue_with_months(task, context, {"platform": "tiktok"}, ["2026-10"])
+        await asyncio.sleep(0.01)
+        scan_service.user_cancel_scan("tiktok")
+        await sequence
+        await asyncio.gather(scan_state.lane("tiktok").task, return_exceptions=True)
+
+    asyncio.run(scenario())
+    assert started == [("2026-11", ())]

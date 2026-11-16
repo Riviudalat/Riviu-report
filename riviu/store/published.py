@@ -11,6 +11,11 @@ and the numbers a running scan is writing stay out, until the next scan of the m
   scan_run, so a later scan's partial writes never reach the page. While a scan of the month runs
   and nothing is kept yet (after a restart), the rows are read now, still without newer links.
 
+A scan limited to some partners ("Quét riêng đối tác", its partners kept in `scan_run.diagnostic`)
+also ends a scan of the month: its partners' links added before it started appear with what it
+read, while other partners' links added after the last whole-month scan stay out until the next
+one (`PostgresStore.last_finished_scan` / `published_record`).
+
 `refresh(platform, thang)` is called when a scan of the month ends, so the snapshot is taken at
 once rather than on the first page view (by then a new scan may already be writing).
 The snapshot lives in memory; after a restart the first read takes it again.
@@ -41,7 +46,8 @@ async def report_rows(store, thang):
     last = await store.last_finished_scan(thang)
     if last is None:
         return await store.report_rows(thang, with_ids=True)
-    run_id, started_at, running = last
+    run_id, started_at, running = last[:3]
+    partner_cutoffs = last[3] if len(last) > 3 else ()
     kept = _SNAPSHOTS.get(key)
     if kept is not None and kept[0] == run_id:
         return kept[1]
@@ -49,7 +55,8 @@ async def report_rows(store, thang):
         kept = _SNAPSHOTS.get(key)
         if kept is not None and kept[0] == run_id:
             return kept[1]
-        rows = await store.report_rows(thang, with_ids=True, created_before=started_at)
+        cut = {"partner_cutoffs": partner_cutoffs} if partner_cutoffs else {}
+        rows = await store.report_rows(thang, with_ids=True, created_before=started_at, **cut)
         # A running scan of this month is writing numbers: show them, but do not keep them.
         if not running:
             _SNAPSHOTS[key] = (run_id, rows)

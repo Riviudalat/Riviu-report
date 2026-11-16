@@ -10,7 +10,7 @@ import { errorMessage, getJson, postJson } from '@/lib/api';
 import { PLATFORMS, PLATFORM_KEYS, WORKER_OPTIONS, isPlatform, type PlatformKey, type ScrapeMode } from '@/lib/platforms';
 import { fetchMonths } from '@/lib/riviuData';
 import {
-  addSlot, formatScheduleTime, LATEST_MONTH, MONTH_PATTERN, normalizeMonths, normalizeOverview, RUN_STATUS, runCountsText, slotMonthLabel,
+  addSlot, formatScheduleTime, LATEST_MONTH, MONTH_PATTERN, PREVIOUS_MONTH, normalizeMonths, normalizeOverview, RUN_STATUS, runCountsText, slotMonthLabel,
   type Schedule, type ScheduleOptions, type ScheduleOverview, type ScheduleSlot,
 } from '@/lib/schedule';
 import { cn } from '@/lib/utils';
@@ -187,10 +187,11 @@ function ScheduleBody() {
   );
 }
 
-/** The months a slot scans: chips, and a picker with "Tháng mới nhất" plus the platform's months. */
+/** The months a slot scans: chips, and a picker with "Tháng mới nhất", "Tháng trước" plus the platform's months. */
 function SlotMonths({ platform, slot, onChange }: { platform: PlatformKey; slot: ScheduleSlot; onChange: (months: string[]) => void }) {
   const months = useQuery({ queryKey: ['rd-months', platform], queryFn: () => fetchMonths(platform), staleTime: 60_000 });
-  const choices = [LATEST_MONTH, ...(months.data?.months ?? []).map(month => month.thang).filter(thang => MONTH_PATTERN.test(thang))];
+  const choices = [LATEST_MONTH, PREVIOUS_MONTH, ...(months.data?.months ?? []).map(month => month.thang).filter(thang => MONTH_PATTERN.test(thang))];
+  const tokenHint: Record<string, string> = { [LATEST_MONTH]: 'Tự chuyển khi có tháng mới', [PREVIOUS_MONTH]: 'Tháng liền trước tháng mới nhất' };
   const toggle = (value: string, checked: boolean) => {
     const next = checked ? [...slot.months, value] : slot.months.filter(item => item !== value);
     if (next.length) onChange(normalizeMonths(next));
@@ -198,7 +199,7 @@ function SlotMonths({ platform, slot, onChange }: { platform: PlatformKey; slot:
   return (
     <span className="flex min-w-0 flex-1 flex-wrap items-center gap-1.5" data-testid={`slot-months-${slot.time}`}>
       {slot.months.map(value => (
-        <span key={value} className={cn('rounded-md px-1.5 py-0.5 text-xs font-medium', value === LATEST_MONTH ? 'bg-primary/12 text-primary' : 'bg-muted text-foreground/80')}>
+        <span key={value} className={cn('rounded-md px-1.5 py-0.5 text-xs font-medium', tokenHint[value] ? 'bg-primary/12 text-primary' : 'bg-muted text-foreground/80')}>
           {slotMonthLabel(value)}
         </span>
       ))}
@@ -221,7 +222,7 @@ function SlotMonths({ platform, slot, onChange }: { platform: PlatformKey; slot:
                   <li key={value}>
                     <label htmlFor={id} className="flex cursor-pointer items-center gap-2 rounded-md px-2 py-1.5 text-sm hover:bg-accent">
                       <Checkbox id={id} checked={checked} disabled={checked && slot.months.length === 1} onCheckedChange={value2 => toggle(value, value2 === true)} />
-                      <span className="flex-1">{slotMonthLabel(value)}{value === LATEST_MONTH && <span className="block text-[11px] text-muted-foreground">Tự chuyển khi có tháng mới</span>}</span>
+                      <span className="flex-1">{slotMonthLabel(value)}{tokenHint[value] && <span className="block text-[11px] text-muted-foreground">{tokenHint[value]}</span>}</span>
                       {count !== undefined && <span className="text-xs tabular-nums text-muted-foreground">{count} link</span>}
                     </label>
                   </li>

@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Viewer } from '@/lib/auth';
 import { appStore, cancelScraping, handleSocketMessage, platformScanBusy, resetAppState, setSocketForTests, skipRetryWait, updateScanSettings } from './app';
 import {
-  buildRdScanRequest, installRiviuDataHooks, loadMonths, loadRows, resetRiviuDataModule, selectRdPlatform, startRdScan,
+  buildRdScanRequest, installRiviuDataHooks, loadMonths, loadRows, rdScanChoice, resetRiviuDataModule, selectRdPlatform, setRdScanChoice, startRdScan,
 } from './riviuData';
 
 const ADMIN: Viewer = { authenticated: true, username: 'quantri', role: 'admin', serverMode: true };
@@ -74,11 +74,13 @@ describe('starting a month scan', () => {
     await loadMonths('threads');
   });
 
-  it('sends the month, the saved toolbar and no file or proxy text', async () => {
+  it('sends the newest month and the one before it, the saved toolbar and no file or proxy text', async () => {
     await updateScanSettings('tiktok', { workers: 5, scrapeMode: 'hybrid', useProxy: true });
     await startRdScan();
+    // The server resolves "latest" / "previous" and scans them one after another.
     expect(sent).toEqual([{
-      action: 'start', platform: 'tiktok', sheet_name: '2026-10', workers: 5, scrape_mode: 'hybrid', use_proxy: true, proxy_text: '', partners: [], retry_failed: true,
+      action: 'start', platform: 'tiktok', sheet_name: '', months: ['latest', 'previous'], workers: 5, scrape_mode: 'hybrid', use_proxy: true,
+      proxy_text: '', partners: [], retry_failed: true,
     }]);
     expect(appStore.get().scan.phase).toBe('starting');
     // The toolbar was saved server side for every platform.
@@ -92,6 +94,17 @@ describe('starting a month scan', () => {
     await startRdScan();
     expect(calls.some(call => call.url.startsWith('/threads-session/status'))).toBe(true);
     expect(sent[0]).toMatchObject({ platform: 'threads', use_threads_session: true, threads_session_generation: 'gen-2' });
+  });
+
+  it('scans one month, or only one partner, when chosen; a new scope drops the partner', async () => {
+    setRdScanChoice({ scope: '2026-10', partner: 'A' });
+    expect(buildRdScanRequest(appStore.get()).request?.payload).toMatchObject({ sheet_name: '2026-10', partners: ['A'] });
+    expect(buildRdScanRequest(appStore.get()).request?.payload).not.toHaveProperty('months');
+    expect(buildRdScanRequest(appStore.get()).request?.logLine).toContain('Tháng 10/2026 • chỉ đối tác: A');
+    setRdScanChoice({ scope: 'recent' });
+    expect(rdScanChoice(appStore.get())).toEqual({ scope: 'recent', partner: '' });
+    // Each platform keeps its own choice.
+    expect(rdScanChoice(appStore.get(), 'threads')).toEqual({ scope: 'recent', partner: '' });
   });
 
   it('refuses to start without a Threads cookie and opens its dialog', async () => {

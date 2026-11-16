@@ -67,8 +67,10 @@ PAYLOAD_KEYS = (
 # retired, others went on) is retried too, but only after the 429 wait and only when the run
 # was not stopped by 429 on every route. Never retried: access_denied / proxy_auth /
 # geo_restricted / audience (a block is never worked around), redirect / profile_redirect,
-# and auth_* (the session is the problem).
-THREADS_RETRYABLE_KINDS = frozenset({"transport", "http", "payload", "browser_start"})
+# and auth_invalid / auth_checkpoint (the session is the problem; the run stops on them). An
+# auth_unknown row is recorded only after the cookie checked valid again mid-run
+# (threads.SESSION_RECHECK_SECONDS), so it is a page-level hiccup and retried like one.
+THREADS_RETRYABLE_KINDS = frozenset({"transport", "http", "payload", "browser_start", "auth_unknown"})
 THREADS_LOGIN_KINDS = frozenset({"invalid_post"})
 _TIKTOK_HTTP_CODE = re.compile(r"\bhttp\s+(\d{3})\b", re.IGNORECASE)
 

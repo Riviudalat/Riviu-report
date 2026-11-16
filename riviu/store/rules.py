@@ -71,6 +71,13 @@ def parse_thang(value) -> tuple[date, date]:
     return start, end
 
 
+def previous_thang(thang: str) -> str:
+    """'2026-01' -> '2025-12' (the calendar month before; no check that it holds rows)."""
+    start, _ = parse_thang(thang)
+    before = start - timedelta(days=1)
+    return f"{before.year:04d}-{before.month:02d}"
+
+
 def current_thang(now: datetime | None = None) -> str:
     moment = (now or datetime.now(UTC)).astimezone(LOCAL_TZ)
     return f"{moment.year:04d}-{moment.month:02d}"

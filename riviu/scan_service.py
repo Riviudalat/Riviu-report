@@ -32,7 +32,7 @@ from riviu.reports import build_google_push_rows
 from riviu.store import config as store_config
 from riviu.store import postgres as store_postgres
 from riviu.store import published as store_published
-from riviu.store.rules import MonthError, parse_thang
+from riviu.store.rules import MonthError, parse_thang, previous_thang
 from riviu.source_files import (
     SourceRequestError,
     file_display_label,
@@ -424,7 +424,20 @@ async def run_scan_passes(target_path, events, options, journal, runner=None):
         events.retry_pass = True
         events.retry_count = count
         if transient:
-            await run_retry_pass(runner, target_path, events, options, journal, journal.retry_candidates)
+            try:
+                await run_retry_pass(runner, target_path, events, options, journal, journal.retry_candidates)
+            except SessionError as error:
+                # A cookie session that stops verifying in the retry pass ends that pass only: the
+                # main pass is saved and complete, so the run still finishes (and is published).
+                if options.get("threads_cookies") is None:
+                    raise
+                try:
+                    await context.complete_blocking(
+                        context.threads_session_manager().invalidate, options.get("threads_generation"), error.state)
+                except Exception:
+                    pass
+                await manager.broadcast_log(
+                    f"Lượt quét lại dừng vì phiên Threads chưa xác minh được ({error}); giữ kết quả lượt chính.", level="WARN")
         if login_retry and not (events.terminal or {}).get("stopReason"):
             try:
                 session = await threads_session_overrides(options, session_generation)
@@ -524,6 +537,12 @@ def store_scan(options):
     return options.get("file_id") == RIVIU_DATA_FILE_ID
 
 
+def scan_partners(options):
+    """The partners a scan is limited to ([] = every link), without repeats."""
+    names = options["partners"] or ([options["partner"]] if options["partner"] else [])
+    return list(dict.fromkeys(clean_text(name) for name in names if clean_text(name)))
+
+
 def month_title(thang):
     year, month = thang.split("-")
     return f"tháng {int(month)}/{year}"
@@ -538,6 +557,8 @@ class StoreRun:
         self.platform = options["platform"]
         self.thang = options["sheet_name"]
         self.store = store_postgres.PostgresStore(self.platform, store_config.ACTIVE.database_url)
+        # "Quét riêng đối tác": only these partners' links (recorded in scan_run for the published snapshot).
+        self.partners = scan_partners(options)
         self.lock_conn = None
         self.run_id = None
         self.totals = {"written": 0, "skipped": 0, "lockedRows": 0, "invalidLinks": 0}
@@ -556,6 +577,7 @@ class StoreRun:
                     conn, platform=self.platform, month_start=month_start,
                     trigger="timer" if scheduled else "thu_cong",
                     started_by=self.options.get("started_by") or ("riviu-reports:lich" if scheduled else "riviu-reports"),
+                    partners=self.partners,
                 )
             except BaseException:
                 await store_postgres.release_scan_lock(conn, self.platform)
@@ -567,8 +589,7 @@ class StoreRun:
 
     async def runner(self, target_path, events, options):
         """One pass (main or retry) on rows read now; the session's writes are flushed by the scanner."""
-        partners = options["partners"] or ([options["partner"]] if options["partner"] else [])
-        session = await self.store.open_scan(self.thang, selected_partners=partners, run_id=self.run_id, events=events)
+        session = await self.store.open_scan(self.thang, selected_partners=self.partners, run_id=self.run_id, events=events)
         try:
             if session.locked_count and not self.totals["lockedRows"]:
                 await scan_state.lane(self.platform).manager.broadcast_log(f"Bỏ qua {session.locked_count} dòng đã khoá chỉ số.")
@@ -649,7 +670,9 @@ async def run_scraper_safely(target_path, options, run_context=None):
         if store_scan(options):
             if run_context is None:
                 run_id = manager.begin_run(platform, RIVIU_DATA_FILE_ID, options["sheet_name"])["runId"]
-            options = {**options, "file_label": f"Riviu Data {month_title(options['sheet_name'])}"}
+            partners = scan_partners(options)
+            only = f" • đối tác: {', '.join(partners)}" if partners else ""
+            options = {**options, "file_label": f"Riviu Data {month_title(options['sheet_name'])}{only}"}
             journal = await begin_journal(options)
             terminal = await run_store_passes(options, events, journal)
             await journal.clear()
@@ -713,6 +736,51 @@ def start_scan_task(target_path, options):
     return task, run_context
 
 
+# Per platform: the task that starts the remaining months of a manual multi-month Riviu Data scan.
+MONTH_SEQUENCES = {}
+
+
+def scan_ended_cancelled(task, run_context):
+    """The run of `task` ended by a cancel (user or shutdown)."""
+    manager = scan_state.lane(run_context["platform"]).manager
+    status = manager.last_status if manager.context.get("runId") == run_context["runId"] else {}
+    return task.cancelled() or bool(status.get("cancelled")) or status.get("phase") == "cancelled"
+
+
+def continue_with_months(task, run_context, payload, months):
+    """After `task` (a Riviu Data scan of one month) ends, scan `months` one after another, each as
+    its own run and scan_run like a schedule slot's months. A cancel ends the sequence; a failed
+    month does not (the next one still runs)."""
+    sequence = asyncio.create_task(_run_month_sequence(task, run_context, payload, list(months)))
+    MONTH_SEQUENCES[run_context["platform"]] = sequence
+    return sequence
+
+
+async def _run_month_sequence(task, run_context, payload, months):
+    platform = run_context["platform"]
+    manager = scan_state.lane(platform).manager
+    while months:
+        await asyncio.wait({task})
+        left = ", ".join(month_title(thang) for thang in months)
+        if scan_ended_cancelled(task, run_context):
+            await manager.broadcast_log(f"Đã hủy: không quét tiếp {left}.", level="WARN")
+            return
+        if scan_state.start_blocked(platform):
+            await manager.broadcast_log(f"Không quét tiếp {left}: đang có phiên quét hoặc thao tác dữ liệu khác.", level="WARN")
+            return
+        thang = months.pop(0)
+        # Held from the check until the scan task exists, like a schedule slot (scheduler.run_job).
+        with scan_state.scan_starting(platform):
+            try:
+                target_path, options = await prepare_scan_start({**payload, "sheet_name": thang})
+            except Exception as error:  # noqa: BLE001 - reported like a schedule slot that cannot start
+                await manager.broadcast_log(f"Không bắt đầu quét {month_title(thang)}: {error}", level="ERROR")
+                return
+            task, run_context = start_scan_task(target_path, options)
+            await manager.broadcast_status(manager.last_status)
+            await manager.broadcast_log(f"Quét tiếp {month_title(thang)} (tháng tiếp theo của lần quét này).")
+
+
 def finalize_unstarted_run(task, run_id, platform=None):
     # Cancellation may arrive before the coroutine executes even its first line.
     manager = scan_state.lane(platform).manager
@@ -747,20 +815,46 @@ async def store_months(platform):
     return await store_postgres.PostgresStore(platform, store_config.ACTIVE.database_url).months()
 
 
-async def resolve_store_month(platform, value):
-    """The month a Riviu Data scan covers: the one asked for, else the newest month not in the future."""
+# Month tokens a Riviu Data scan (a schedule slot, or "Quét" on the admin page) may name in place of
+# "YYYY-MM": the newest month (not in the future), and the calendar month before it.
+LATEST_MONTH = "latest"
+PREVIOUS_MONTH = "previous"
+MONTH_TOKENS = (LATEST_MONTH, PREVIOUS_MONTH)
+
+
+async def resolve_store_month(platform, value, *, latest=None):
+    """The month a Riviu Data scan covers: "YYYY-MM" as asked; "" / "latest": the newest month not in
+    the future; "previous": the month before that one. `latest` skips reading the month list again."""
     from riviu.api.riviu_data import default_month
 
     thang = clean_text(value)
-    if not thang:
-        thang = default_month([month for month, _ in await store_months(platform)])
-        if not thang:
+    if not thang or thang in MONTH_TOKENS:
+        newest = latest or default_month([month for month, _ in await store_months(platform)])
+        if not newest:
             raise ValueError("Riviu Data chưa có tháng nào để quét.")
+        thang = previous_thang(newest) if thang == PREVIOUS_MONTH else newest
     try:
         parse_thang(thang)
     except MonthError as error:
         raise ValueError(f"Tháng không hợp lệ: {error}") from error
     return thang
+
+
+async def resolve_store_months(platform, values):
+    """Month tokens / "YYYY-MM" values -> the months to scan, in the given order, each once."""
+    if not isinstance(values, list) or not values or len(values) > 24:
+        raise ValueError("Danh sách tháng quét không hợp lệ.")
+    latest = None
+    months = []
+    for value in values:
+        if not isinstance(value, str):
+            raise ValueError("Danh sách tháng quét không hợp lệ.")
+        if clean_text(value) in MONTH_TOKENS and latest is None:
+            latest = await resolve_store_month(platform, LATEST_MONTH)
+        thang = await resolve_store_month(platform, value, latest=latest)
+        if thang not in months:
+            months.append(thang)
+    return months
 
 
 async def prepare_scan_start(payload):

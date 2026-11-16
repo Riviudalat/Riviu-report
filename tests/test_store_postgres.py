@@ -541,3 +541,113 @@ def test_report_pages_show_each_month_as_its_last_finished_scan_left_it():
     asyncio.run(published.report_rows(store, "2026-10"))
     assert store.reads[-2:] == [("2026-10", True, later)] * 2 and published.kept_count("tiktok", "2026-10") is None
     published.clear()
+
+
+# ---- "Quét riêng đối tác", month tokens and date-range reports (16/11/2026) -----------------
+
+def test_a_partner_scan_publishes_the_new_links_of_its_partners_only():
+    # Staff add links after the 07:30 scan; scanning one partner later shows that partner's new
+    # links (with what the scan read), while other partners' new links wait for the next full scan.
+    from riviu.store import published
+
+    morning = dt.datetime(2026, 11, 16, 0, 30, tzinfo=dt.UTC)
+    partner_scan = dt.datetime(2026, 11, 16, 7, 0, tzinfo=dt.UTC)
+    hour = dt.timedelta(hours=1)
+    base = {**_db_record(1, TIKTOK_ROWS[0]), "nguoi_air": None}
+    records = [
+        {**base, "id": 1, "doi_tac": "Cafe A", "tao_luc": morning - hour},
+        {**base, "id": 2, "doi_tac": "Cafe A", "tao_luc": morning + hour},
+        {**base, "id": 3, "doi_tac": "Tiệm Bánh B", "tao_luc": morning + hour},
+        {**base, "id": 4, "doi_tac": "cafe a, Tiệm Bánh B", "tao_luc": morning + hour},
+        {**base, "id": 5, "doi_tac": "Cafe A", "tao_luc": partner_scan + hour},
+    ]
+    runs = [  # scan_run, newest finished first (postgres._FINISHED_SCANS)
+        {"id": 92, "started_at": partner_scan, "partners": ["Cafe A"], "running": False},
+        {"id": 91, "started_at": morning, "partners": [], "running": False},
+        {"id": 90, "started_at": morning - 24 * hour, "partners": [], "running": False},
+    ]
+    reads = []
+
+    async def connect(_dsn):
+        reads.append(len(reads))
+        return FakeConn(runs if len(reads) % 2 else records)  # last_finished_scan, then report_rows
+
+    store = postgres.PostgresStore("tiktok", "postgresql://riviu_scanner@fake/db", connector=connect)
+    published.clear()
+    rows = asyncio.run(published.report_rows(store, "2026-11")).rows
+    assert [row["_id"] for row in rows] == [1, 2, 4]
+    # Before any whole-month scan finished, a partner scan alone publishes nothing: rows as they are now.
+    assert asyncio.run(postgres.PostgresStore("tiktok", "x", connector=lambda _dsn: _conn(FakeConn(runs[:1])))
+                       .last_finished_scan("2026-11")) is None
+    published.clear()
+    # The partner scan records its partners in scan_run, which is what the snapshot reads back.
+    conn = FakeConn()
+    asyncio.run(postgres.begin_scan_run(conn, platform="tiktok", month_start=dt.date(2026, 11, 1), trigger="thu_cong",
+                                        started_by="riviu-reports:admin", partners=["Cafe A"]))
+    assert '"partners": ["Cafe A"]' in conn.calls[-1][1][-1]
+
+
+async def _conn(conn):
+    return conn
+
+
+def test_scan_month_tokens_are_the_newest_month_and_the_calendar_month_before(monkeypatch):
+    from riviu import scan_service
+    from riviu.api import riviu_data
+
+    async def months(_platform):
+        return [("2026-02", 4), ("2026-01", 40), ("2025-11", 30)]  # February created early; no December sheet
+
+    monkeypatch.setattr(scan_service, "store_months", months)
+    monkeypatch.setattr(riviu_data, "current_thang", lambda: "2026-01")
+    resolve = scan_service.resolve_store_months
+    assert asyncio.run(resolve("tiktok", ["latest", "previous", "2026-01", "2025-11"])) == ["2026-01", "2025-12", "2025-11"]
+    for bad in ([], ["2026-13"], [7], "latest"):
+        with pytest.raises(ValueError):
+            asyncio.run(resolve("tiktok", bad))
+
+
+def test_a_date_range_report_takes_the_posts_aired_in_it_from_the_months_around_it(monkeypatch):
+    from riviu.api import riviu_data
+    from riviu.store import published
+    from riviu.workbook.report_rows import SheetReportRows
+
+    first, last = dt.date(2026, 10, 15), dt.date(2026, 11, 5)
+    assert riviu_data.range_months(["2026-12", "2026-11", "2026-10", "2026-09", "2026-08"], first, last) == [
+        "2026-09", "2026-10", "2026-11", "2026-12"]
+
+    def row(row_id, aired, partners=("Cafe A",)):
+        return {"_id": row_id, "NGÀY AIR": dt.datetime(*aired) if aired else "", "partners": list(partners),
+                "TÊN KÊNH": "Kênh", "LINK AIR": f"{TIKTOK_URL[:-1]}{row_id}", "LƯỢT XEM": 500}
+
+    # The September sheet holds a post aired 15/10 (filed a month early); the October sheet one without a date.
+    sheets = {
+        "2026-09": SheetReportRows(rows=(row(1, (2026, 9, 30)), row(2, (2026, 10, 15), ["Tiệm Bánh B"])), partners=()),
+        "2026-10": SheetReportRows(rows=(row(3, (2026, 10, 20)), row(4, None)), partners=()),
+        "2026-11": SheetReportRows(rows=(row(5, (2026, 11, 5), ["cafe a"]), row(6, (2026, 11, 6))), partners=()),
+    }
+
+    class Store:
+        platform = "tiktok"
+
+        async def months(self):
+            return [(thang, 1) for thang in sorted(sheets, reverse=True)]
+
+    async def snapshot(_store, thang):
+        return sheets[thang]
+
+    monkeypatch.setattr(riviu_data.internal_scan, "make_store", lambda _platform: Store())
+    monkeypatch.setattr(published, "report_rows", snapshot)
+    sheet_rows, undated = asyncio.run(riviu_data.range_report_rows("tiktok", first, last))
+    assert [item["_id"] for item in sheet_rows.rows] == [2, 3, 5] and undated == 1
+    assert sheet_rows.partners == ("Tiệm Bánh B", "Cafe A")
+    from riviu.reports import build_export_payload_from_rows
+
+    payload = build_export_payload_from_rows(sheet_rows, ["Cafe A"], False, 0, riviu_data.range_label(first, last), "tiktok")
+    assert "15-10-2026_den_05-11-2026" in payload["filename"]
+    report = openpyxl.load_workbook(__import__("io").BytesIO(payload["content"])).active
+    assert report["A2"].value.startswith("Tổng link: 2 ")
+    for start, end, message in (("2026-11-05", "2026-10-15", "trước"), ("2026-13-01", "2026-12-01", "YYYY-MM-DD"),
+                                ("2025-01-01", "2026-11-05", "tối đa")):
+        with pytest.raises(riviu_data.RangeError, match=message):
+            riviu_data.parse_range(start, end)

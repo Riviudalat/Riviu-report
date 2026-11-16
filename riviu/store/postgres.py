@@ -99,25 +99,29 @@ async def release_scan_lock(conn, platform):
 
 # ---- scan_run -------------------------------------------------------------------------
 
-async def begin_scan_run(conn, *, platform, month_start, trigger, started_by, scan_run_id=None):
+async def begin_scan_run(conn, *, platform, month_start, trigger, started_by, scan_run_id=None, partners=None):
     """The scan_run id for this scan: the requested one (phase 'yeu_cau' from Riviu Data) or a new row.
 
     UPDATE on scan_run is granted (migration 0011, riviu_scanner.sql); a missing grant is a
     deployment error and fails the start instead of silently recording a second run.
+    `partners`: a scan of only these partners' links records them as `diagnostic.partners`, which
+    the published snapshot reads (store/published.py); a whole-month scan records none.
     """
+    diagnostic = json.dumps({"partners": list(partners)}, ensure_ascii=False) if partners else None
     if scan_run_id is not None:
         run_id = await conn.fetchval(
-            "UPDATE public.scan_run SET phase = $3, thang_nam = $4, mode = coalesce(mode, $5) "
+            "UPDATE public.scan_run SET phase = $3, thang_nam = $4, mode = coalesce(mode, $5), "
+            "diagnostic = CASE WHEN $6::jsonb IS NULL THEN diagnostic ELSE coalesce(diagnostic, '{}'::jsonb) || $6::jsonb END "
             "WHERE id = $1 AND platform = $2 AND finished_at IS NULL RETURNING id",
-            scan_run_id, platform, PHASE_RUNNING, month_start, trigger,
+            scan_run_id, platform, PHASE_RUNNING, month_start, trigger, diagnostic,
         )
         if run_id is None:
             raise ScanRunNotFound(f"scan_run {scan_run_id} không tồn tại, khác nền tảng hoặc đã kết thúc")
         return run_id
     return await conn.fetchval(
-        "INSERT INTO public.scan_run (platform, thang_nam, phase, mode, started_by) "
-        "VALUES ($1, $2, $3, $4, $5) RETURNING id",
-        platform, month_start, PHASE_RUNNING, trigger, started_by,
+        "INSERT INTO public.scan_run (platform, thang_nam, phase, mode, started_by, diagnostic) "
+        "VALUES ($1, $2, $3, $4, $5, $6::jsonb) RETURNING id",
+        platform, month_start, PHASE_RUNNING, trigger, started_by, diagnostic,
     )
 
 
@@ -172,20 +176,48 @@ def _report_query(platform, created_before=False):
     return (
         f"SELECT v.id, v.ngay_air, c.ten_kenh, v.link_air, v.doi_tac, {metrics}, "
         # Read through jsonb so the query also works before Riviu Data adds nguoi_air (0013).
-        f"c.cap_nhat_lan_cuoi, c.trang_thai_quet, to_jsonb(v) ->> 'nguoi_air' AS nguoi_air{links} "
+        f"c.cap_nhat_lan_cuoi, c.trang_thai_quet, to_jsonb(v) ->> 'nguoi_air' AS nguoi_air{links}"
+        + (", v.tao_luc " if created_before else " ")
         + _MONTH_FROM.format(t=table)
         + (" AND v.tao_luc < $3" if created_before else "")
         + " ORDER BY v.id"
     )
 
 
-# The month's last scan that ran to its end (stopped early counts: it saved what it read), and
-# whether a scan of that month is running now.
-_LAST_FINISHED_SCAN = (
-    "SELECT id, started_at, EXISTS (SELECT 1 FROM public.scan_run WHERE platform = $1 AND thang_nam = $2 "
+def published_record(record, created_before, partner_cuts):
+    """A post the published snapshot shows: added before the last whole-month scan started, or
+    before a later scan of one of its partners started (that scan read it)."""
+    added = record["tao_luc"]
+    if added < created_before:
+        return True
+    if not partner_cuts:
+        return False
+    keys = row_partner_keys(partners_from_doi_tac(record["doi_tac"]))
+    return any(added < started and keys & selected for selected, started in partner_cuts)
+
+
+# The month's scans that ran to their end (stopped early counts: it saved what it read), newest
+# first, each with the partners it was limited to (none: the whole month), and whether a scan of
+# that month is running now. last_finished_scan walks them back to the last whole-month scan.
+FINISHED_SCAN_LOOKBACK = 200
+_FINISHED_SCANS = (
+    "SELECT id, started_at, "
+    "CASE WHEN jsonb_typeof(diagnostic -> 'partners') = 'array' "
+    "THEN ARRAY(SELECT jsonb_array_elements_text(diagnostic -> 'partners')) ELSE '{}'::text[] END AS partners, "
+    "EXISTS (SELECT 1 FROM public.scan_run WHERE platform = $1 AND thang_nam = $2 "
     f"AND phase = '{PHASE_RUNNING}') AS running FROM public.scan_run WHERE platform = $1 AND thang_nam = $2 "
-    f"AND phase IN ('{PHASE_DONE}', '{PHASE_STOPPED}') AND finished_at IS NOT NULL ORDER BY finished_at DESC LIMIT 1"
+    f"AND phase IN ('{PHASE_DONE}', '{PHASE_STOPPED}') AND finished_at IS NOT NULL "
+    f"ORDER BY finished_at DESC LIMIT {FINISHED_SCAN_LOOKBACK}"
 )
+
+
+def partner_scan_keys(names):
+    """The keys a partner-limited scan selects rows by (the same casefold match as scan_row_fields)."""
+    return frozenset(clean_text(name).casefold() for name in names or () if clean_text(name))
+
+
+def row_partner_keys(partners):
+    return {partner.casefold() for partner in partners}
 
 
 def tiktok_scan_rows(records, label, selected_keys=None):
@@ -289,20 +321,54 @@ class PostgresStore:
             await conn.close()
         return [(f"{record['thang_nam'].year:04d}-{record['thang_nam'].month:02d}", int(record["rows"])) for record in records]
 
+    async def scan_partner_counts(self, months):
+        """[(partner, links)] a scan of these months ("YYYY-MM") can be limited to: the partners named
+        on their live, unlocked posts as they are now (links added since the last scan included),
+        first spelling, sorted by name."""
+        starts = [rules.parse_thang(thang)[0] for thang in months]
+        conn = await self.connect()
+        try:
+            records = await conn.fetch(
+                f"SELECT v.doi_tac FROM public.v_{self.table} v LEFT JOIN bao_cao.{self.table}_chi_so c USING (id) "
+                "WHERE date_trunc('month', v.thang_nam)::date = ANY($1::date[]) AND NOT coalesce(c.khoa_chi_so, false) "
+                "AND coalesce(btrim(v.link_air), '') <> ''",
+                starts,
+            )
+        finally:
+            await conn.close()
+        names, counts = {}, defaultdict(int)
+        for record in records:
+            for partner in dict.fromkeys(partners_from_doi_tac(record["doi_tac"])):
+                key = partner.casefold()
+                names.setdefault(key, partner)
+                counts[key] += 1
+        return sorted(((names[key], counts[key]) for key in names), key=lambda item: item[0].casefold())
+
     async def last_finished_scan(self, thang):
-        """(scan_run id, started_at, a scan of the month running now) of the month's last finished scan, or None."""
+        """What the month's published snapshot is cut at, or None before any whole-month scan finished:
+        (id of the newest finished scan, started_at of the last finished whole-month scan, a scan of
+        the month running now, ((partner keys, started_at) of each partner scan that finished after
+        that whole-month scan, newest first))."""
         month_start, _ = rules.parse_thang(thang)
         conn = await self.connect()
         try:
-            record = await conn.fetchrow(_LAST_FINISHED_SCAN, self.platform, month_start)
+            records = await conn.fetch(_FINISHED_SCANS, self.platform, month_start)
         finally:
             await conn.close()
-        return (record["id"], record["started_at"], record["running"]) if record else None
+        partner_cuts = []
+        for record in records:
+            keys = partner_scan_keys(record["partners"])
+            if not keys:
+                return records[0]["id"], record["started_at"], record["running"], tuple(partner_cuts)
+            partner_cuts.append((keys, record["started_at"]))
+        return None
 
-    async def report_rows(self, thang, *, conn=None, with_ids=False, created_before=None):
+    async def report_rows(self, thang, *, conn=None, with_ids=False, created_before=None, partner_cutoffs=()):
         """The month's report rows (same dict keys as the workbook path), from v_<platform>;
         `with_ids` adds each post's id as `_id` and its Người air as `_nguoiAir` (the web app's table);
-        `created_before` (a datetime) leaves out posts added since then."""
+        `created_before` (a datetime) leaves out posts added since then, except those of a partner
+        whose later partner scan started after they were added (`partner_cutoffs`, from
+        last_finished_scan)."""
         from riviu.workbook.platforms import get_platform
 
         spec = get_platform(self.platform)
@@ -314,7 +380,9 @@ class PostgresStore:
                 if created_before is None:
                     records = await conn.fetch(_report_query(self.platform), month_start, month_end)
                 else:
-                    records = await conn.fetch(_report_query(self.platform, True), month_start, month_end, created_before)
+                    newest_cut = max([created_before, *(started for _, started in partner_cutoffs)])
+                    records = await conn.fetch(_report_query(self.platform, True), month_start, month_end, newest_cut)
+                    records = [record for record in records if published_record(record, created_before, partner_cutoffs)]
         finally:
             if own:
                 await conn.close()

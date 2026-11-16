@@ -13,6 +13,7 @@ from riviu import server_context as context
 from riviu.api import security
 from riviu.platforms.tiktok import read_scrape_history
 from riviu.source_files import SourceRequestError
+from riviu.store import config as store_config
 from riviu.workbook.platforms import PLATFORMS
 
 
@@ -74,14 +75,25 @@ async def websocket_endpoint(websocket: WebSocket):
                 # Who started it, for Riviu Data's scan_run; never taken from the client.
                 identity = security.request_identity(websocket) if server_mode.ACTIVE is not None else None
                 payload = {**payload, "started_by": f"riviu-reports:{identity['username']}" if identity else ""}
+                # Riviu Data: `months` (e.g. ["latest", "previous"]) scans several months one after another.
+                months = payload.pop("months", None)
                 try:
+                    if months is not None and store_config.ACTIVE.postgres:
+                        months = await scan_service.resolve_store_months(platform or "tiktok", months)
+                        payload["sheet_name"] = months[0]
+                    else:
+                        months = None
                     target_path, options = await scan_service.prepare_scan_start(payload)
                 except (SourceRequestError, ValueError) as error:
                     await reject_start(str(error))
                     continue
-                scan_service.start_scan_task(target_path, options)
+                task, run_context = scan_service.start_scan_task(target_path, options)
                 lane = scan_state.lane(options["platform"])
                 await lane.manager.broadcast_status(lane.manager.last_status)
+                if months and len(months) > 1:
+                    later = ", ".join(scan_service.month_title(thang) for thang in months[1:])
+                    await lane.manager.broadcast_log(f"Quét {scan_service.month_title(months[0])} trước, xong sẽ quét tiếp {later}.")
+                    scan_service.continue_with_months(task, run_context, payload, months[1:])
             elif action == "cancel":
                 # A user cancel is final: the run is not resumed later (scan_service.user_cancel_scan).
                 channel = scan_state.lane(platform).manager

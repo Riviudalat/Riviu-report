@@ -139,3 +139,46 @@ def test_initial_auth_unknown_and_browser_launch_failure_stops_run(tmp_path, mon
     monkeypatch.setattr(threads, "fetch_threads_http", lambda *_args, **_kwargs: threads.failure("not verified", "auth_unknown"))
     with pytest.raises(sessions.SessionError):
         asyncio.run(threads.run_threads_scraper(path, mode="hybrid", session_cookies=[COOKIE]))
+
+
+@pytest.mark.parametrize("recheck", ["valid", "unknown"])
+def test_one_unverified_page_after_logged_in_pages_rechecks_the_cookie_instead_of_stopping(tmp_path, monkeypatch, recheck):
+    # 15-16/11/2026 07:30: one page answered without login evidence stopped the November scan
+    # after 82 and 472 of 508 links, although the cookie checked valid again right after.
+    import openpyxl
+    from riviu import scan_journal
+    from riviu.workbook_utils import worksheet_find_column_index
+
+    path = workbook(tmp_path, count=3)
+    checks = []
+
+    async def verify(_cookies, proxy_config=None):
+        checks.append(proxy_config)
+        return {"state": "valid" if len(checks) == 1 else recheck}  # the preflight, then the re-check
+
+    def fetch(url, **_kwargs):
+        if url.endswith("1"):
+            return threads.failure("not verified", "auth_unknown")
+        return {**metrics(views=10, likes=5, comments=1, reposts=0), "auth_verified": True}
+
+    monkeypatch.setattr(sessions, "verify_cookies", verify)
+    monkeypatch.setattr(threads, "async_playwright", NoBrowser)
+    monkeypatch.setattr(threads, "fetch_threads_http", fetch)
+    scan = threads.run_threads_scraper(path, worker_count=1, mode="request", session_cookies=[COOKIE])
+    if recheck != "valid":
+        with pytest.raises(sessions.SessionError):
+            asyncio.run(scan)
+        assert len(checks) == 2
+        return
+    asyncio.run(scan)
+    assert len(checks) == 2
+    book = openpyxl.load_workbook(path)
+    sheet = book["Data"]
+    status_column = worksheet_find_column_index(sheet, [threads.SCAN_STATUS_HEADER])
+    statuses = [sheet.cell(row=row, column=status_column).value for row in (2, 3, 4)]
+    likes = [sheet.cell(row=row, column=2).value for row in (2, 3, 4)]
+    book.close()
+    assert statuses[0] == statuses[2] == "Success" and likes == [5, None, 5]
+    assert statuses[1] == f"Error: {threads.UNVERIFIED_PAGE_MESSAGE}"
+    # The retry pass rescans it like a transient error.
+    assert scan_journal.result_code("threads", statuses[1], "auth_unknown") == "r"

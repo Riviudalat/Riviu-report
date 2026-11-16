@@ -11,8 +11,9 @@ scan options to use. At a slot the server, for that platform:
 3. never pushes to Google: "Tạo sheet" stays a manual admin action.
 
 With `RIVIU_STORAGE=postgres` step 1 is skipped: each slot scans its `months` of the platform's
-posts in Riviu Data one after another ("latest" is the newest month,
-`scan_service.resolve_store_month`), and the platforms run side by side, each in its own scan
+posts in Riviu Data one after another ("latest" is the newest month and "previous" the month before
+it, `scan_service.resolve_store_month`; a slot without a list scans both), and the platforms run side
+by side, each in its own scan
 lane (`scan_state.lane`). On workbook storage the platforms run one after the other.
 
 Option `retryFailed` (default on) adds the scan's retry pass over transient failures; a scheduled
@@ -61,8 +62,13 @@ MAX_BODY_BYTES = 16384
 # current minute's slots; the minutes in between are skipped, never replayed.
 CATCH_UP_LIMIT = timedelta(minutes=3)
 SLOT_PATTERN = re.compile(r"^(?:[01]\d|2[0-3]):[0-5]\d$")
-# Riviu Data months a slot scans: "latest" (the newest month, followed as months are added) or "YYYY-MM".
-LATEST_MONTH = "latest"
+# Riviu Data months a slot scans: "latest" (the newest month, followed as months are added),
+# "previous" (the month before it, followed the same way) or "YYYY-MM".
+LATEST_MONTH = scan_service.LATEST_MONTH
+PREVIOUS_MONTH = scan_service.PREVIOUS_MONTH
+MONTH_TOKENS = scan_service.MONTH_TOKENS
+# A slot without a month list scans the newest month and the one before it (owner, 16/11/2026).
+DEFAULT_SLOT_MONTHS = (LATEST_MONTH, PREVIOUS_MONTH)
 MONTH_PATTERN = re.compile(r"^\d{4}-(?:0[1-9]|1[0-2])$")
 MAX_SLOT_MONTHS = 24
 SCRAPE_MODES = scan_settings.SCRAPE_MODES
@@ -124,19 +130,20 @@ def _normalize_options(platform, raw):
 
 def _normalize_months(raw):
     if raw is None:
-        return [LATEST_MONTH]
+        return list(DEFAULT_SLOT_MONTHS)
     if not isinstance(raw, list) or len(raw) > MAX_SLOT_MONTHS:
         raise _invalid(f"Mỗi khung giờ quét tối đa {MAX_SLOT_MONTHS} tháng.")
     months = []
     for value in raw:
-        if not isinstance(value, str) or not (value == LATEST_MONTH or MONTH_PATTERN.match(value)):
-            raise _invalid("Tháng của khung giờ phải là \"latest\" hoặc dạng YYYY-MM.")
+        if not isinstance(value, str) or not (value in MONTH_TOKENS or MONTH_PATTERN.match(value)):
+            raise _invalid("Tháng của khung giờ phải là \"latest\", \"previous\" hoặc dạng YYYY-MM.")
         if value not in months:
             months.append(value)
     if not months:
         raise _invalid("Mỗi khung giờ cần ít nhất một tháng để quét.")
-    # The newest month first, then the chosen months newest first.
-    return sorted(months, key=lambda value: (value != LATEST_MONTH, "" if value == LATEST_MONTH else _desc(value)))
+    # The newest month, the month before it, then the chosen months newest first.
+    return sorted(months, key=lambda value: (
+        MONTH_TOKENS.index(value) if value in MONTH_TOKENS else len(MONTH_TOKENS), "" if value in MONTH_TOKENS else _desc(value)))
 
 
 def _desc(month):
@@ -442,12 +449,13 @@ class Scheduler:
                 await self.record(platform, slot, scheduled, "failed", f"Lỗi kỹ thuật: {error}")
 
     async def run_months(self, platform, slot, scheduled):
-        """The slot's Riviu Data months, newest first; "latest" is resolved now and never scanned twice."""
+        """The slot's Riviu Data months, newest first; "latest" / "previous" are resolved now, and a month is
+        never scanned twice in one slot."""
         months = slot_months(await asyncio.to_thread(load_schedule), platform, slot)
         done = set()
         for month in months:
             try:
-                thang = await scan_service.resolve_store_month(platform, "" if month == LATEST_MONTH else month)
+                thang = await scan_service.resolve_store_month(platform, month)
             except asyncio.CancelledError:
                 raise
             except Exception as error:
