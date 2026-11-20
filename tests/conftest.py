@@ -11,6 +11,15 @@ def _no_threads_http_pacing(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _no_threads_preflight_waits(monkeypatch):
+    """An undecided cookie check is retried after PREFLIGHT_RETRY_WAITS seconds; tests do not wait."""
+    async def no_wait(_seconds):
+        return None
+
+    monkeypatch.setattr(threads, "_preflight_sleep", no_wait)
+
+
+@pytest.fixture(autouse=True)
 def _classic_page_without_web_app_build(monkeypatch, tmp_path_factory):
     """`/` and `/admin` serve the React build when riviu/web/app exists (after `npm run build`);
     tests get the classic page unless they point WEB_APP_INDEX at a build themselves."""

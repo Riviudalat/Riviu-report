@@ -212,6 +212,30 @@ def test_cookie_redirect_guard_rejects_other_hosts_and_http():
     assert guard.redirect_request(request, None, 302, "Found", {}, URL + "?next=1").full_url.startswith(URL)
 
 
+@pytest.mark.parametrize("answers, scans", [
+    (["unknown", "valid"], True),               # 20/11/2026: one undecided check stopped the November run
+    (["unknown", "unknown", "unknown"], False),  # still undecided after every retry: the run fails
+    (["expired"], False),                       # a definite answer fails at once, no retry
+])
+def test_an_undecided_cookie_check_is_retried_before_the_run_fails(tmp_path, monkeypatch, answers, scans):
+    path = workbook(tmp_path)
+    calls = []
+    async def verify(_cookies, proxy_config=None):
+        calls.append(proxy_config)
+        return {"state": answers[min(len(calls), len(answers)) - 1]}
+    monkeypatch.setattr(sessions, "verify_cookies", verify)
+    monkeypatch.setattr(threads, "async_playwright", NoBrowser)
+    monkeypatch.setattr(threads, "fetch_threads_http", lambda *_a, **_k: {**metrics(views=10, likes=1, comments=0, reposts=0), "auth_verified": True})
+    scan = threads.run_threads_scraper(path, mode="request", session_cookies=[COOKIE])
+    if scans:
+        asyncio.run(scan)
+        assert openpyxl.load_workbook(path)["Data"]["B2"].value == 1
+    else:
+        with pytest.raises(sessions.SessionError):
+            asyncio.run(scan)
+    assert len(calls) == len(answers)
+
+
 def test_auth_preflight_fails_before_workbook_changes(tmp_path, monkeypatch):
     path = workbook(tmp_path)
     original = path.read_bytes()

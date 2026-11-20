@@ -46,6 +46,24 @@ def test_threads_url_requires_real_post_host_and_identity():
     assert not same_threads_post(URL, "https://www.threads.com/?error=invalid_post")
     assert same_threads_post(SHARE_URL, "https://www.threads.com/@trangxinh718/post/DdQ8PEekxig")
     assert not same_threads_post(SHARE_URL, "https://www.threads.com/?error=invalid_post")
+    # An account that changed its @username keeps the post's shortcode; another post never matches.
+    assert same_threads_post(URL, "https://www.threads.com/@ten_moi/post/DdRIHGWCURV")
+    assert not same_threads_post(URL, "https://www.threads.com/@miri_viu/post/DdQ8PEekxig")
+    assert not same_threads_post(URL, "https://www.threads.com/@miri_viu")
+
+
+def test_a_post_whose_account_was_renamed_is_read_from_its_new_link():
+    # 20/11/2026: @pengya249/post/DfPM7OImEfb redirected to @gaitaygocviet1104/post/DfPM7OImEfb (the
+    # same post) and was recorded as "chuyển hướng sang URL khác" with no numbers.
+    from test_threads_transport import html_fixture
+
+    result = parse_threads_http(html_fixture(), "https://www.threads.com/@ten_cu/post/Fixture",
+                                "https://www.threads.com/@demo/post/Fixture")
+    assert result["error"] == "" and "error_kind" not in result
+    assert result["channel"] == "demo"
+    assert result["metrics"] == {"views": 15, "likes": 0, "comments": 0, "reposts": 0, "shares": 2}
+    moved = parse_threads_http(html_fixture(), "https://www.threads.com/@demo/post/Khac", "https://www.threads.com/@demo/post/Fixture")
+    assert moved["error_kind"] == "redirect"
 
 
 def test_http_parser_keeps_missing_counts_unknown():

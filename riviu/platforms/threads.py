@@ -101,6 +101,12 @@ RATE_LIMIT_STOP_REASON = "rate_limit"
 SESSION_RECHECK_SECONDS = 120
 MAX_UNVERIFIED_PAGES = 20
 UNVERIFIED_PAGE_MESSAGE = "Trang bài chưa xác minh được phiên đăng nhập Threads (cookie vẫn hợp lệ); giữ số cũ, sẽ quét lại."
+# The cookie check before a run: a check that could not tell (state "unknown": a slow or dropped
+# connection on the route) is tried again after these waits before the run fails. A definite answer
+# (expired, invalid, checkpoint, SOCKS5 auth route) fails at once. Evidence (20/11/2026 07:30): the
+# November run failed this check and scanned nothing, while the October run passed it seconds later.
+PREFLIGHT_RETRY_WAITS = (20, 60)
+_preflight_sleep = asyncio.sleep
 
 
 def resolve_threads_proxies(base_dir, proxy_text="", mode="request"):
@@ -198,10 +204,12 @@ def post_identity(url):
 
 
 def same_threads_post(requested_url, final_url):
+    """The final URL is the requested post. A post keeps its shortcode when its account changes
+    @username (Threads then redirects the old link to the new one), so the shortcode decides."""
     requested = post_identity(requested_url)
     final = post_identity(final_url)
     if requested is not None:
-        return requested == final
+        return final is not None and requested[1] == final[1]
     return bool(is_threads_link(requested_url) and SHARE_PATH.fullmatch(urlparse(normalize_threads_url(requested_url)).path) and final)
 
 
@@ -879,14 +887,24 @@ async def run_threads_scraper(file_path, websocket_manager=None, worker_count=3,
                         pass
 
 
-async def _preflight_session(session_cookies, proxies, diagnostics):
-    """Verify the cookie on the one route the whole run will use; never fall back to direct."""
-    check = await threads_session.verify_cookies(session_cookies, proxies[0] if proxies else None)
-    if diagnostics is not None:
-        diagnostics["authState"] = check["state"]
-    if check["state"] != "valid":
-        reported = {"expired", "invalid", "checkpoint", "proxy_unsupported"}
-        raise threads_session.SessionError(check["state"] if check["state"] in reported else "unknown")
+async def _preflight_session(session_cookies, proxies, diagnostics, websocket_manager=None):
+    """Verify the cookie on the one route the whole run will use; never fall back to direct.
+
+    An undecided check is retried (PREFLIGHT_RETRY_WAITS); a definite answer fails at once."""
+    reported = {"expired", "invalid", "checkpoint", "proxy_unsupported"}
+    for attempt, wait in enumerate((*PREFLIGHT_RETRY_WAITS, None), start=1):
+        check = await threads_session.verify_cookies(session_cookies, proxies[0] if proxies else None)
+        if diagnostics is not None:
+            diagnostics["authState"] = check["state"]
+            diagnostics["preflightAttempts"] = attempt
+        if check["state"] == "valid":
+            return
+        if check["state"] in reported or wait is None:
+            raise threads_session.SessionError(check["state"] if check["state"] in reported else "unknown")
+        if websocket_manager:
+            await websocket_manager.broadcast_log(
+                f"CẢNH BÁO: Chưa xác minh được cookie Threads (lần {attempt}); thử lại sau {wait} giây.")
+        await _preflight_sleep(wait)
 
 
 async def _request_once(url, config, session_cookies):
@@ -1065,7 +1083,7 @@ async def _run_threads_scraper(file_path, websocket_manager=None, worker_count=3
     if use_proxy and not proxies:
         raise ValueError("Bật proxy nhưng chưa có proxy hợp lệ.")
     if session_cookies is not None:
-        await _preflight_session(session_cookies, proxies, diagnostics)
+        await _preflight_session(session_cookies, proxies, diagnostics, websocket_manager)
     # Loading and scanning a large workbook takes a second; keep the server responsive.
     # Owned like a save: a cancellation waits for the read, so no thread of this run
     # still holds the file once the scan is released.
